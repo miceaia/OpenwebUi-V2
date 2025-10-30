@@ -75,6 +75,10 @@ class OpenWebUI_User_Sync {
         // Sincronización automática
         add_action('user_register', array($this, 'sync_new_user_immediately'), 10, 1);
         add_action('profile_update', array($this, 'check_password_change'), 10, 2);
+
+        // Sincronización automática de grupos con LearnDash
+        add_action('ld_added_group_access', array($this, 'handle_ld_added_group_access'), 10, 2);
+        add_action('ld_removed_group_access', array($this, 'handle_ld_removed_group_access'), 10, 2);
         
         // Admin notices
         add_action('admin_notices', array($this, 'admin_notices'));
@@ -456,6 +460,503 @@ class OpenWebUI_User_Sync {
         }
 
         return null;
+    }
+
+    /**
+     * Buscar un grupo por nombre dentro de la caché local.
+     */
+    private function find_group_by_name($group_name) {
+        if (empty($group_name) || empty($this->groups_cache['groups'])) {
+            return null;
+        }
+
+        foreach ($this->groups_cache['groups'] as $group) {
+            if (!isset($group['name'])) {
+                continue;
+            }
+
+            if (0 === strcasecmp((string) $group['name'], (string) $group_name)) {
+                return $group;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Refrescar la caché de grupos desde la API de OpenWebUI.
+     */
+    private function refresh_groups_cache_from_api() {
+        $result = $this->fetch_openwebui_groups_from_api();
+
+        if (!$result['success']) {
+            return $result;
+        }
+
+        $groups = isset($result['groups']) && is_array($result['groups']) ? $result['groups'] : array();
+        $updated_at = current_time('mysql');
+        $updated_label = '';
+
+        if (!empty($updated_at)) {
+            $formatted = mysql2date(get_option('date_format') . ' ' . get_option('time_format'), $updated_at);
+            if (!empty($formatted)) {
+                $updated_label = sanitize_text_field($formatted);
+            }
+        }
+
+        $this->groups_cache = array(
+            'groups' => $groups,
+            'updated_at' => $updated_at,
+            'updated_label' => $updated_label,
+        );
+
+        update_option('openwebui_groups_cache', $this->groups_cache, false);
+
+        $response = array(
+            'success' => true,
+            'groups' => $groups,
+        );
+
+        if (!empty($result['notice'])) {
+            $response['notice'] = $result['notice'];
+        }
+
+        return $response;
+    }
+
+    /**
+     * Obtener un grupo de OpenWebUI por nombre, creando si es necesario.
+     *
+     * @param string $group_name Nombre del grupo.
+     * @param bool   $create_if_missing Crear el grupo si no existe.
+     * @return array
+     */
+    private function get_openwebui_group_by_name($group_name, $create_if_missing = false) {
+        $group_name = trim((string) $group_name);
+
+        if ($group_name === '') {
+            return array(
+                'success' => false,
+                'message' => esc_html__('Nombre de grupo inválido.', 'openwebui-sync'),
+            );
+        }
+
+        $cached_group = $this->find_group_by_name($group_name);
+
+        if ($cached_group) {
+            return array(
+                'success' => true,
+                'group' => $cached_group,
+            );
+        }
+
+        $refreshed = $this->refresh_groups_cache_from_api();
+        if (!$refreshed['success']) {
+            return $refreshed;
+        }
+
+        $cached_group = $this->find_group_by_name($group_name);
+        if ($cached_group) {
+            return array(
+                'success' => true,
+                'group' => $cached_group,
+            );
+        }
+
+        if (!$create_if_missing) {
+            return array(
+                'success' => true,
+                'group' => null,
+                'message' => esc_html__('El grupo no existe en OpenWebUI.', 'openwebui-sync'),
+            );
+        }
+
+        $created = $this->create_openwebui_group($group_name);
+        if (!$created['success']) {
+            return $created;
+        }
+
+        $refreshed = $this->refresh_groups_cache_from_api();
+        if (!$refreshed['success']) {
+            return $refreshed;
+        }
+
+        $cached_group = $this->find_group_by_name($group_name);
+        if ($cached_group) {
+            return array(
+                'success' => true,
+                'group' => $cached_group,
+            );
+        }
+
+        return array(
+            'success' => false,
+            'message' => esc_html__('El grupo se creó pero no se pudo confirmar en la caché local.', 'openwebui-sync'),
+        );
+    }
+
+    /**
+     * Crear un grupo de OpenWebUI a partir del nombre indicado.
+     */
+    private function create_openwebui_group($group_name) {
+        $group_name = sanitize_text_field($group_name);
+
+        if ($group_name === '') {
+            return array(
+                'success' => false,
+                'message' => esc_html__('Nombre de grupo inválido.', 'openwebui-sync'),
+            );
+        }
+
+        $payloads = array(
+            array('name' => $group_name),
+            array('title' => $group_name),
+            array('group' => array('name' => $group_name)),
+        );
+
+        $endpoints = array(
+            '/api/v1/groups',
+            '/api/groups',
+            '/groups',
+            '/api/v1/admin/groups',
+        );
+
+        $last_error = esc_html__('No se pudo crear el grupo en OpenWebUI.', 'openwebui-sync');
+
+        foreach ($endpoints as $endpoint) {
+            foreach ($payloads as $payload) {
+                $result = $this->call_openwebui_api($endpoint, $payload);
+
+                if ($result['success']) {
+                    return array('success' => true, 'data' => isset($result['data']) ? $result['data'] : array());
+                }
+
+                if (!empty($result['message'])) {
+                    $last_error = $result['message'];
+                }
+            }
+        }
+
+        return array(
+            'success' => false,
+            'message' => $last_error,
+        );
+    }
+
+    /**
+     * Añadir un usuario remoto a un grupo de OpenWebUI.
+     */
+    private function add_remote_user_to_openwebui_group($remote_user_id, $remote_group_id) {
+        $remote_user_id = (string) $remote_user_id;
+        $remote_group_id = (string) $remote_group_id;
+
+        if ($remote_user_id === '' || $remote_group_id === '') {
+            return array(
+                'success' => false,
+                'message' => esc_html__('Datos inválidos para la sincronización de grupo.', 'openwebui-sync'),
+            );
+        }
+
+        $payloads = array(
+            array('userId' => $remote_user_id),
+            array('user_id' => $remote_user_id),
+            array('userIds' => array($remote_user_id)),
+            array('users' => array($remote_user_id)),
+            array('members' => array(array('userId' => $remote_user_id))),
+        );
+
+        $endpoints = array(
+            '/api/v1/groups/%s/members',
+            '/api/groups/%s/members',
+            '/groups/%s/members',
+            '/api/v1/groups/%s/users',
+            '/api/groups/%s/users',
+        );
+
+        $last_error = esc_html__('No se pudo añadir el usuario al grupo de OpenWebUI.', 'openwebui-sync');
+
+        foreach ($endpoints as $endpoint) {
+            $formatted_endpoint = sprintf($endpoint, rawurlencode($remote_group_id));
+
+            foreach ($payloads as $payload) {
+                $result = $this->call_openwebui_api($formatted_endpoint, $payload);
+
+                if ($result['success']) {
+                    return array('success' => true);
+                }
+
+                if (!empty($result['message']) && $this->is_duplicate_group_message($result['message'])) {
+                    return array(
+                        'success' => true,
+                        'duplicate' => true,
+                    );
+                }
+
+                if (!empty($result['message'])) {
+                    $last_error = $result['message'];
+                }
+            }
+        }
+
+        return array(
+            'success' => false,
+            'message' => $last_error,
+        );
+    }
+
+    /**
+     * Eliminar un usuario remoto de un grupo de OpenWebUI.
+     */
+    private function remove_remote_user_from_openwebui_group($remote_user_id, $remote_group_id) {
+        $remote_user_id = (string) $remote_user_id;
+        $remote_group_id = (string) $remote_group_id;
+
+        if ($remote_user_id === '' || $remote_group_id === '') {
+            return array(
+                'success' => false,
+                'message' => esc_html__('Datos inválidos para la sincronización de grupo.', 'openwebui-sync'),
+            );
+        }
+
+        $endpoints = array(
+            '/api/v1/groups/%1$s/members/%2$s',
+            '/api/groups/%1$s/members/%2$s',
+            '/groups/%1$s/members/%2$s',
+            '/api/v1/groups/%1$s/users/%2$s',
+            '/api/groups/%1$s/users/%2$s',
+        );
+
+        $last_error = esc_html__('No se pudo eliminar el usuario del grupo de OpenWebUI.', 'openwebui-sync');
+
+        foreach ($endpoints as $endpoint) {
+            $formatted_endpoint = sprintf(
+                $endpoint,
+                rawurlencode($remote_group_id),
+                rawurlencode($remote_user_id)
+            );
+
+            $result = $this->call_openwebui_api_delete($formatted_endpoint);
+
+            if ($result['success']) {
+                return array('success' => true);
+            }
+
+            if (isset($result['code']) && (int) $result['code'] === 404) {
+                return array(
+                    'success' => true,
+                    'missing' => true,
+                );
+            }
+
+            if (!empty($result['message'])) {
+                $last_error = $result['message'];
+            }
+        }
+
+        return array(
+            'success' => false,
+            'message' => $last_error,
+        );
+    }
+
+    /**
+     * Manejar la asignación automática de grupos de LearnDash en OpenWebUI.
+     */
+    public function handle_ld_added_group_access($user_id, $group_id) {
+        $user_id = absint($user_id);
+        $group_id = absint($group_id);
+
+        if (!$user_id || !$group_id) {
+            return;
+        }
+
+        $user = get_user_by('id', $user_id);
+        if (!$user) {
+            return;
+        }
+
+        $group_post = get_post($group_id);
+        if (!$group_post instanceof WP_Post) {
+            return;
+        }
+
+        $group_name = trim(wp_strip_all_tags($group_post->post_title));
+
+        if ($group_name === '') {
+            $this->log_sync($user_id, 'warning', esc_html__('El grupo de LearnDash no tiene un nombre válido.', 'openwebui-sync'));
+            return;
+        }
+
+        if (empty($this->api_url) || empty($this->api_key)) {
+            $this->log_sync($user_id, 'warning', esc_html__('Sincronización de grupos omitida: la API de OpenWebUI no está configurada.', 'openwebui-sync'));
+            return;
+        }
+
+        $remote_user_id = get_user_meta($user_id, '_openwebui_user_id', true);
+
+        if (empty($remote_user_id)) {
+            $remote_user_id = $this->get_openwebui_user_id_by_email($user->user_email);
+
+            if (!empty($remote_user_id)) {
+                update_user_meta($user_id, '_openwebui_user_id', sanitize_text_field((string) $remote_user_id));
+            }
+        }
+
+        if (empty($remote_user_id)) {
+            $this->log_sync($user_id, 'warning', sprintf(
+                esc_html__('El usuario no tiene un ID válido de OpenWebUI para sincronizar con el grupo "%s".', 'openwebui-sync'),
+                sanitize_text_field($group_name)
+            ));
+            return;
+        }
+
+        $group_lookup = $this->get_openwebui_group_by_name($group_name, true);
+
+        if (empty($group_lookup['success'])) {
+            $message = isset($group_lookup['message']) ? $group_lookup['message'] : esc_html__('Error desconocido al preparar el grupo remoto.', 'openwebui-sync');
+            $this->log_sync($user_id, 'error', sprintf(
+                esc_html__('No se pudo preparar el grupo "%1$s" en OpenWebUI: %2$s', 'openwebui-sync'),
+                sanitize_text_field($group_name),
+                sanitize_text_field((string) $message)
+            ));
+            return;
+        }
+
+        if (empty($group_lookup['group']) || empty($group_lookup['group']['id'])) {
+            $message = isset($group_lookup['message']) ? $group_lookup['message'] : esc_html__('No se recibió información del grupo remoto.', 'openwebui-sync');
+            $this->log_sync($user_id, 'error', sprintf(
+                esc_html__('No se pudo localizar el grupo "%1$s" en OpenWebUI: %2$s', 'openwebui-sync'),
+                sanitize_text_field($group_name),
+                sanitize_text_field((string) $message)
+            ));
+            return;
+        }
+
+        $remote_group_id = $group_lookup['group']['id'];
+
+        $assignment = $this->add_remote_user_to_openwebui_group($remote_user_id, $remote_group_id);
+
+        if (empty($assignment['success'])) {
+            $message = isset($assignment['message']) ? $assignment['message'] : esc_html__('Error desconocido.', 'openwebui-sync');
+            $this->log_sync($user_id, 'error', sprintf(
+                esc_html__('Error al añadir al usuario al grupo "%1$s": %2$s', 'openwebui-sync'),
+                sanitize_text_field($group_name),
+                sanitize_text_field((string) $message)
+            ));
+            return;
+        }
+
+        if (!empty($assignment['duplicate'])) {
+            $this->log_sync($user_id, 'info', sprintf(
+                esc_html__('El usuario ya pertenecía al grupo "%s" en OpenWebUI.', 'openwebui-sync'),
+                sanitize_text_field($group_name)
+            ));
+            return;
+        }
+
+        $this->log_sync($user_id, 'info', sprintf(
+            esc_html__('Usuario sincronizado con el grupo "%s" en OpenWebUI.', 'openwebui-sync'),
+            sanitize_text_field($group_name)
+        ));
+    }
+
+    /**
+     * Manejar la baja automática de grupos de LearnDash en OpenWebUI.
+     */
+    public function handle_ld_removed_group_access($user_id, $group_id) {
+        $user_id = absint($user_id);
+        $group_id = absint($group_id);
+
+        if (!$user_id || !$group_id) {
+            return;
+        }
+
+        $user = get_user_by('id', $user_id);
+        if (!$user) {
+            return;
+        }
+
+        $group_post = get_post($group_id);
+        if (!$group_post instanceof WP_Post) {
+            return;
+        }
+
+        $group_name = trim(wp_strip_all_tags($group_post->post_title));
+
+        if ($group_name === '') {
+            $this->log_sync($user_id, 'warning', esc_html__('El grupo de LearnDash no tiene un nombre válido.', 'openwebui-sync'));
+            return;
+        }
+
+        if (empty($this->api_url) || empty($this->api_key)) {
+            $this->log_sync($user_id, 'warning', esc_html__('Sincronización de grupos omitida: la API de OpenWebUI no está configurada.', 'openwebui-sync'));
+            return;
+        }
+
+        $remote_user_id = get_user_meta($user_id, '_openwebui_user_id', true);
+
+        if (empty($remote_user_id)) {
+            $remote_user_id = $this->get_openwebui_user_id_by_email($user->user_email);
+
+            if (!empty($remote_user_id)) {
+                update_user_meta($user_id, '_openwebui_user_id', sanitize_text_field((string) $remote_user_id));
+            }
+        }
+
+        if (empty($remote_user_id)) {
+            $this->log_sync($user_id, 'info', sprintf(
+                esc_html__('El usuario no tiene un ID de OpenWebUI, se omite la baja en el grupo "%s".', 'openwebui-sync'),
+                sanitize_text_field($group_name)
+            ));
+            return;
+        }
+
+        $group_lookup = $this->get_openwebui_group_by_name($group_name, false);
+
+        if (empty($group_lookup['success'])) {
+            $message = isset($group_lookup['message']) ? $group_lookup['message'] : esc_html__('Error desconocido al buscar el grupo remoto.', 'openwebui-sync');
+            $this->log_sync($user_id, 'error', sprintf(
+                esc_html__('No se pudo localizar el grupo "%1$s" en OpenWebUI: %2$s', 'openwebui-sync'),
+                sanitize_text_field($group_name),
+                sanitize_text_field((string) $message)
+            ));
+            return;
+        }
+
+        if (empty($group_lookup['group']) || empty($group_lookup['group']['id'])) {
+            $this->log_sync($user_id, 'info', sprintf(
+                esc_html__('El grupo "%s" no existe en OpenWebUI, no se realizaron cambios.', 'openwebui-sync'),
+                sanitize_text_field($group_name)
+            ));
+            return;
+        }
+
+        $remote_group_id = $group_lookup['group']['id'];
+
+        $removal = $this->remove_remote_user_from_openwebui_group($remote_user_id, $remote_group_id);
+
+        if (empty($removal['success'])) {
+            $message = isset($removal['message']) ? $removal['message'] : esc_html__('Error desconocido.', 'openwebui-sync');
+            $this->log_sync($user_id, 'error', sprintf(
+                esc_html__('Error al eliminar al usuario del grupo "%1$s": %2$s', 'openwebui-sync'),
+                sanitize_text_field($group_name),
+                sanitize_text_field((string) $message)
+            ));
+            return;
+        }
+
+        if (!empty($removal['missing'])) {
+            $this->log_sync($user_id, 'info', sprintf(
+                esc_html__('El usuario no pertenecía al grupo "%s" en OpenWebUI.', 'openwebui-sync'),
+                sanitize_text_field($group_name)
+            ));
+            return;
+        }
+
+        $this->log_sync($user_id, 'info', sprintf(
+            esc_html__('Usuario eliminado del grupo "%s" en OpenWebUI.', 'openwebui-sync'),
+            sanitize_text_field($group_name)
+        ));
     }
     
     /**

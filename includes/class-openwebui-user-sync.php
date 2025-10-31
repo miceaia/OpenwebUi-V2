@@ -214,7 +214,18 @@ class OpenWebUI_User_Sync {
         }
 
         $id = '';
-        $id_fields = array('id', '_id', 'uuid', 'slug', 'key');
+        $id_fields = array(
+            'id',
+            '_id',
+            'uuid',
+            'slug',
+            'key',
+            'group_id',
+            'groupId',
+            'guid',
+            'external_id',
+            'externalId',
+        );
 
         foreach ($id_fields as $field) {
             if (isset($group[$field]) && $group[$field] !== '') {
@@ -228,7 +239,15 @@ class OpenWebUI_User_Sync {
         }
 
         $name = '';
-        $name_fields = array('name', 'title', 'label', 'display_name');
+        $name_fields = array(
+            'name',
+            'title',
+            'label',
+            'display_name',
+            'displayName',
+            'group_name',
+            'groupName',
+        );
 
         foreach ($name_fields as $field) {
             if (isset($group[$field]) && $group[$field] !== '') {
@@ -252,7 +271,16 @@ class OpenWebUI_User_Sync {
         }
 
         $member_count = 0;
-        $member_fields = array('member_count', 'members', 'users');
+        $member_fields = array(
+            'member_count',
+            'memberCount',
+            'members_count',
+            'membersCount',
+            'members',
+            'users',
+            'users_count',
+            'usersCount',
+        );
 
         foreach ($member_fields as $field) {
             if (isset($group[$field])) {
